@@ -1,0 +1,123 @@
+---
+services:
+
+  api:
+    build: .
+    restart: unless-stopped
+    entrypoint: ["python", "-u", "main.py"]
+    depends_on:
+      agent:
+        condition: service_healthy
+    environment:
+      DOMAIN: microservice.${DOMAIN}
+      DID_SOV: ${DID_KEY}
+      DID_KEY: ${DID_KEY}
+      DID_WEB: ${DID_WEB}
+      ISSUER_NAME: ${ISSUER_NAME}
+      SECRET_KEY: ${SECRET_KEY}
+      AGENT_URL: http://agent:8020
+      DIDCOMM_URL: ${DIDCOMM_URL}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.api.rule=Host(`microservice.${DOMAIN}`)
+      - traefik.http.routers.api.entrypoints=websecure
+      - traefik.http.routers.api.tls.certresolver=myresolver
+      - traefik.http.services.api.loadbalancer.server.port=8000
+
+  agent:
+    image: ghcr.io/hyperledger/aries-cloudagent-python:py3.12-1.0.0rc5
+    restart: unless-stopped
+    entrypoint: ["aca-py", "start"]
+    command: [
+      '--auto-provision',
+      '--no-ledger',
+      '--preserve-exchange-records',
+      '--debug-credentials',
+      '--auto-ping-connection',
+      '--auto-accept-invites',
+      '--auto-accept-requests',
+      '--auto-respond-credential-offer',
+      '--auto-respond-credential-request',
+      '--auto-store-credential',
+      '--outbound-transport', 'http',
+      '--inbound-transport', 'http', '0.0.0.0', '8021',
+      '--outbound-transport', 'ws',
+      '--inbound-transport', 'ws', '0.0.0.0', '8022',
+      '--endpoint', 'https://didcomm.${DOMAIN}',
+      '--admin', '0.0.0.0', '8020',
+      '--admin-insecure-mode',
+      '--wallet-name', '${DOMAIN}',
+      '--wallet-key', '${SECRET_KEY}',
+      '--wallet-type', 'askar',
+      '--wallet-storage-type', 'postgres_storage',
+      '--wallet-storage-config', '{"url":"postgres:5432", "wallet_scheme":"MultiWalletSingleTable"}',
+      '--wallet-storage-creds', '{"account":"${POSTGRES_USER}","password": "${POSTGRES_PASSWORD}","admin_account":"${POSTGRES_USER}", "admin_password":"${POSTGRES_PASSWORD}"}',
+      '--wallet-allow-insecure-seed',
+    ]
+    healthcheck:
+      test: curl --fail http://agent:8020/status/ready || exit 1
+      interval: 2s
+      retries: 5
+      start_period: 2s
+      timeout: 2s
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.agent.rule=Host(`agent.${DOMAIN}`)
+      - traefik.http.routers.agent.entrypoints=websecure
+      - traefik.http.routers.agent.tls.certresolver=myresolver
+      - traefik.http.services.agent.loadbalancer.server.port=8020
+
+  caddy:
+    image: caddy
+    restart: unless-stopped
+    configs:
+      - source: Caddyfile
+        target: /etc/caddy/Caddyfile
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.caddy.rule=Host(`didcomm.${DOMAIN}`)
+      - traefik.http.routers.caddy.entrypoints=websecure
+      - traefik.http.routers.caddy.tls.certresolver=myresolver
+      - traefik.http.services.caddy.loadbalancer.server.port=2019
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    ports:
+      - 5432:5432
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+  traefik:
+    image: traefik:v2.10
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.myresolver.acme.tlschallenge=true
+      - --certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json
+    ports:
+      - 443:443
+    volumes:
+      - .letsencrypt:/letsencrypt
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+volumes:
+  postgres_data:
+
+configs:
+  Caddyfile:
+    content: |
+      :2019 {
+                @ws {
+                        header Upgrade websocket
+                }
+                reverse_proxy agent:8021
+                reverse_proxy @ws agent:8022
+      }
